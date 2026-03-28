@@ -1,6 +1,13 @@
+import os
 import sys
 import traceback
+import tempfile
 from io import StringIO
+
+try:
+    import docker
+except ImportError:
+    docker = None
 
 from langchain_deepseek import ChatDeepSeek
 from langchain_core.prompts import ChatPromptTemplate
@@ -114,6 +121,36 @@ Answer:"""
             "source_documents": docs
         }
 
+    def generate_query_suggestions(self, context_docs: List[Document], chat_history: List[dict]) -> List[str]:
+        """基于上下文和聊天历史生成查询建议"""
+
+        # 提取关键概念
+        context_text = "\n".join([doc.page_content[:500] for doc in context_docs[:3]])
+        history_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_history[-4:]])
+
+        prompt = f"""基于以下论文内容和对话历史，生成3-5个相关的学术问题建议：
+
+论文内容摘要：
+{context_text[:1000]}
+
+对话历史：
+{history_text}
+
+请生成具体的问题建议，帮助用户深入理解论文：
+1.
+2.
+3.
+4.
+5.
+
+只返回问题列表，不要其他内容。"""
+
+        suggestions = (ChatPromptTemplate.from_template("{prompt}") | self.llm | StrOutputParser()).invoke({"prompt": prompt})
+
+        # 解析建议
+        lines = [line.strip() for line in suggestions.split('\n') if line.strip() and line[0].isdigit()]
+        return [line.split('. ', 1)[1] if '. ' in line else line for line in lines[:5]]
+
     def generate_code(self, method_description: str) -> str:
         """Generate executable Python code from a method description."""
         sindy_hint = "\n请特别使用 pysindy 库来实现 SINDy 相关算法。\n" if "sindy" in method_description.lower() else ""
@@ -137,6 +174,48 @@ Answer:"""
 
     def execute_code(self, code: str) -> dict:
         """Safely execute code and return output or error."""
+
+        if docker:
+            # Try Docker sandbox execution first
+            with tempfile.TemporaryDirectory() as tmpdir:
+                script_path = os.path.join(tmpdir, "code.py")
+                with open(script_path, "w", encoding="utf-8") as f:
+                    f.write(code)
+
+                client = docker.from_env()
+                try:
+                    container = client.containers.run(
+                        "python:3.12",
+                        command=f"python /code.py",
+                        mem_limit="256m",
+                        nano_cpus=int(0.5 * 1e9),
+                        network_disabled=True,
+                        read_only=True,
+                        pids_limit=100,
+                        detach=True,
+                        auto_remove=True,
+                        volumes={tmpdir: {'bind': '/','mode': 'ro'}}
+                    )
+                    exit_code = container.wait(timeout=20)
+                    logs = container.logs(stdout=True, stderr=True, stream=False).decode("utf-8", errors="ignore")
+                    if exit_code.get("StatusCode", 1) == 0:
+                        return {"success": True, "output": logs}
+                    else:
+                        return {"success": False, "error": f"Docker execution failed, exit code {exit_code}. Logs:\n{logs}"}
+                except Exception as e:
+                    # fallback to local execution if docker is unavailable or fails
+                    docker_err = f"Docker execution error: {e}. Falling back to local execution."
+                finally:
+                    try:
+                        for c in client.containers.list(all=True, filters={"ancestor": "python:3.12"}):
+                            if c.status != "removed":
+                                c.remove(force=True)
+                    except Exception:
+                        pass
+        else:
+            docker_err = None
+
+        # Fallback: local Python sandboxed exec
         old_stdout = sys.stdout
         old_stderr = sys.stderr
         sys.stdout = StringIO()
@@ -168,9 +247,13 @@ Answer:"""
         try:
             exec(code, exec_globals, exec_locals)
             output = sys.stdout.getvalue() + sys.stderr.getvalue()
+            if docker_err:
+                output = f"{docker_err}\n{output}"
             return {"success": True, "output": output}
         except Exception:
             error_msg = traceback.format_exc()
+            if docker_err:
+                error_msg = f"{docker_err}\n{error_msg}"
             return {"success": False, "error": error_msg}
         finally:
             sys.stdout = old_stdout
